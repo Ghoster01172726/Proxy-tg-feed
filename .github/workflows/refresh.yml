@@ -42,6 +42,16 @@ jobs:
                       port_int = int(port)
                   except ValueError:
                       continue
+                  # Skip proxies clearly targeted at another country's users —
+                  # e.g. ".ir." subdomains / "iran" in the hostname mark ones
+                  # meant for Iran, which often refuse connections from
+                  # elsewhere. The channel doesn't label geo-targeting
+                  # reliably, so this only filters what's actually visible in
+                  # the hostname, not a guarantee every remaining entry works
+                  # from Russia specifically.
+                  host_lower = server.lower()
+                  if "iran" in host_lower or re.search(r"(^|\.)ir(\.|$)", host_lower):
+                      continue
                   secret = params.get("secret", "")
                   key = (server, port_int, secret)
                   if key in seen:
