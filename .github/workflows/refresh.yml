@@ -15,20 +15,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Scrape the channel and write proxies.json
+      - name: Scrape the channels and write proxies.json
         run: |
           python3 - <<'PY'
-          import json, re, urllib.parse, urllib.request
+          import json, re, socket, urllib.parse, urllib.request
 
-          url = "https://t.me/s/ProxyMTProto"
+          CHANNELS = ["ProxyMTProto", "mtpro_xyz"]
           entries = []
-          try:
-              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Android) ProxyTG/2.0"})
-              with urllib.request.urlopen(req, timeout=15) as resp:
-                  html = resp.read().decode("utf-8", errors="replace")
+          seen = set()
+          pattern = re.compile(r'(?:tg://proxy|https://t\.me/proxy)\?[^"\'\s<)]+')
 
-              pattern = re.compile(r'(?:tg://proxy|https://t\.me/proxy)\?[^"\'\s<)]+')
-              seen = set()
+          for channel in CHANNELS:
+              url = f"https://t.me/s/{channel}"
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Android) ProxyTG/2.0"})
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      html = resp.read().decode("utf-8", errors="replace")
+              except Exception as e:
+                  print(f"scrape of {channel} failed, skipping it: {e}")
+                  continue
+
               for m in pattern.finditer(html):
                   link = (m.group(0).replace("&amp;", "&").replace("&quot;", '"')
                           .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">"))
@@ -45,10 +51,11 @@ jobs:
                   # Skip proxies clearly targeted at another country's users —
                   # e.g. ".ir." subdomains / "iran" in the hostname mark ones
                   # meant for Iran, which often refuse connections from
-                  # elsewhere. The channel doesn't label geo-targeting
-                  # reliably, so this only filters what's actually visible in
-                  # the hostname, not a guarantee every remaining entry works
-                  # from Russia specifically.
+                  # elsewhere. The channels don't label geo-targeting
+                  # reliably in the hostname, so this only filters what's
+                  # actually visible there, not a guarantee every remaining
+                  # entry works from Russia specifically — that's what the
+                  # IP-geolocation pass below is for.
                   host_lower = server.lower()
                   if "iran" in host_lower or re.search(r"(^|\.)ir(\.|$)", host_lower):
                       continue
@@ -58,13 +65,55 @@ jobs:
                       continue
                   seen.add(key)
                   entries.append({"host": server, "port": port_int, "secret": secret, "label": server})
-          except Exception as e:
-              print(f"scrape failed, keeping the previous proxies.json untouched: {e}")
+
+          if not entries:
+              print("no entries scraped from any channel, keeping the previous proxies.json untouched")
               raise SystemExit(0)
+
+          # Resolve each unique host to an IP and batch-geolocate it (ip-api.com,
+          # free, no key, up to 100 per request), so the app can show/prioritize
+          # proxies whose server actually sits in Russia instead of guessing
+          # from the hostname text.
+          host_ip = {}
+          for e in entries:
+              host = e["host"]
+              if host in host_ip:
+                  continue
+              try:
+                  host_ip[host] = socket.gethostbyname(host)
+              except Exception:
+                  host_ip[host] = None
+
+          ip_country = {}
+          ips = sorted({ip for ip in host_ip.values() if ip})
+          for i in range(0, len(ips), 100):
+              batch = ips[i:i + 100]
+              payload = json.dumps([{"query": ip, "fields": "status,countryCode,query"} for ip in batch]).encode()
+              try:
+                  req = urllib.request.Request(
+                      "http://ip-api.com/batch", data=payload,
+                      headers={"Content-Type": "application/json"},
+                  )
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      for r in json.loads(resp.read()):
+                          if r.get("status") == "success":
+                              ip_country[r["query"]] = r.get("countryCode")
+              except Exception as e:
+                  print(f"geo-lookup batch failed, leaving those entries untagged: {e}")
+
+          for e in entries:
+              ip = host_ip.get(e["host"])
+              country = ip_country.get(ip) if ip else None
+              if country:
+                  e["country"] = country
+
+          # RU-tagged entries first, so the app's default (unsorted) fallback still favors them.
+          entries.sort(key=lambda e: e.get("country") != "RU")
 
           with open("proxies.json", "w") as f:
               json.dump(entries, f)
-          print(f"wrote {len(entries)} proxies")
+          ru_count = sum(1 for e in entries if e.get("country") == "RU")
+          print(f"wrote {len(entries)} proxies ({ru_count} tagged RU)")
           PY
 
       - name: Commit if changed
